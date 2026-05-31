@@ -11,8 +11,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class HeartwithUploader {
-    private static final long BATCH_WINDOW_MS = 8_000L;
-    private static final long MAX_BATCH_WINDOW_MS = 8_000L;
+    private static final long MIN_BATCH_WINDOW_MS = 8_000L;
+    private static final long MAX_BATCH_WINDOW_MS = 30_000L;
+    private static final long FLUSH_TIMER_SLACK_MS = 5_000L;
     private static final long OFFLINE_CACHE_MS = 300_000L;
     private static final long INITIAL_RETRY_BACKOFF_MS = 15_000L;
     private static final long MAX_RETRY_BACKOFF_MS = 120_000L;
@@ -34,6 +35,8 @@ public final class HeartwithUploader {
     private int lastUploadedBpm = -1;
     private boolean uploadInFlight;
     private boolean delayedFlushScheduled;
+    private long delayedFlushDueElapsedMs;
+    private int delayedFlushGeneration;
 
     public HeartwithUploader(Executor worker) {
         this(worker, new UrlConnectionHeartwithHttpClient());
@@ -128,7 +131,7 @@ public final class HeartwithUploader {
                 return;
             }
             if (!config.enabled) {
-                samples.clear();
+                clearSamplesAndCancelDelayedFlush();
                 session = null;
                 notifyStatus("上传已关闭");
                 return;
@@ -149,7 +152,7 @@ public final class HeartwithUploader {
             }
             Sample last = samples.peekLast();
             lastUploadedBpm = last == null ? lastUploadedBpm : last.bpm;
-            samples.clear();
+            clearSamplesAndCancelDelayedFlush();
             lastFlushMs = System.currentTimeMillis();
             nextUploadAttemptMs = 0L;
             retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
@@ -209,34 +212,84 @@ public final class HeartwithUploader {
             lastFlushMs = samples.peekFirst().tMs;
         }
         Sample first = samples.peekFirst();
-        if (now - lastFlushMs >= BATCH_WINDOW_MS) {
+        long sinceLastFlushMs = now - lastFlushMs;
+        if (lastUploadedBpm <= 0) {
+            return sinceLastFlushMs >= MIN_BATCH_WINDOW_MS;
+        }
+        if (sinceLastFlushMs < MIN_BATCH_WINDOW_MS) {
+            return false;
+        }
+        if (Math.abs(bpm - lastUploadedBpm) >= CHANGE_FLUSH_BPM) {
             return true;
         }
-        if (first != null && now - first.tMs >= MAX_BATCH_WINDOW_MS) {
-            return true;
-        }
-        return lastUploadedBpm > 0 && Math.abs(bpm - lastUploadedBpm) >= CHANGE_FLUSH_BPM;
+        return first != null && now - first.tMs >= MAX_BATCH_WINDOW_MS;
     }
 
     private long nextFlushDelayMs(long now) {
         if (nextUploadAttemptMs > now) {
             return Math.max(1_000L, Math.min(MAX_RETRY_BACKOFF_MS, nextUploadAttemptMs - now));
         }
-        return MAX_BATCH_WINDOW_MS;
+        if (samples.isEmpty()) {
+            return MAX_BATCH_WINDOW_MS;
+        }
+        long sinceLastFlush = lastFlushMs <= 0L ? 0L : now - lastFlushMs;
+        if (lastUploadedBpm <= 0) {
+            return Math.max(1_000L, MIN_BATCH_WINDOW_MS - sinceLastFlush);
+        }
+        Sample last = samples.peekLast();
+        if (last != null && Math.abs(last.bpm - lastUploadedBpm) >= CHANGE_FLUSH_BPM) {
+            return Math.max(1_000L, MIN_BATCH_WINDOW_MS - sinceLastFlush);
+        }
+        Sample first = samples.peekFirst();
+        long firstAgeMs = first == null ? 0L : now - first.tMs;
+        return Math.max(1_000L, MAX_BATCH_WINDOW_MS - firstAgeMs);
     }
 
     private void scheduleDelayedFlush(long delayMs) {
-        if (delayedFlushScheduled || samples.isEmpty()) {
+        if (samples.isEmpty()) {
+            return;
+        }
+        long normalizedDelayMs = relaxedFlushDelayMs(delayMs);
+        long dueElapsedMs = android.os.SystemClock.elapsedRealtime() + normalizedDelayMs;
+        if (delayedFlushScheduled && dueElapsedMs >= delayedFlushDueElapsedMs - 250L) {
             return;
         }
         delayedFlushScheduled = true;
-        handler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                delayedFlushScheduled = false;
-                flush();
-            }
-        }, Math.max(1_000L, delayMs));
+        delayedFlushDueElapsedMs = dueElapsedMs;
+        final int generation = ++delayedFlushGeneration;
+        try {
+            handler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    worker.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            flushDelayedEntry(generation);
+                        }
+                    });
+                }
+            }, normalizedDelayMs);
+        } catch (Throwable ignored) {
+            delayedFlushScheduled = false;
+            delayedFlushDueElapsedMs = 0L;
+        }
+    }
+
+    private synchronized void flushDelayedEntry(int generation) {
+        if (generation != delayedFlushGeneration) {
+            return;
+        }
+        delayedFlushScheduled = false;
+        delayedFlushDueElapsedMs = 0L;
+        flushLockedEntry();
+    }
+
+    private long relaxedFlushDelayMs(long delayMs) {
+        long baseDelayMs = Math.max(1_000L, delayMs);
+        if (baseDelayMs <= 2_000L) {
+            return baseDelayMs;
+        }
+        return baseDelayMs + Math.min(FLUSH_TIMER_SLACK_MS, Math.max(1_000L, baseDelayMs / 4L));
     }
 
     private byte[] buildBatchCbor(String collectorId, long packetSeq, HeartwithUploadConfig uploadConfig) {
@@ -277,6 +330,13 @@ public final class HeartwithUploader {
         if (listener != null) {
             listener.onUploadStatus(status);
         }
+    }
+
+    private void clearSamplesAndCancelDelayedFlush() {
+        samples.clear();
+        delayedFlushGeneration++;
+        delayedFlushScheduled = false;
+        delayedFlushDueElapsedMs = 0L;
     }
 
     private String match(String value, Pattern pattern) {
