@@ -14,7 +14,8 @@ public final class HeartwithUploader {
     private static final long BATCH_WINDOW_MS = 8_000L;
     private static final long MAX_BATCH_WINDOW_MS = 8_000L;
     private static final long OFFLINE_CACHE_MS = 300_000L;
-    private static final long RETRY_BACKOFF_MS = 15_000L;
+    private static final long INITIAL_RETRY_BACKOFF_MS = 15_000L;
+    private static final long MAX_RETRY_BACKOFF_MS = 120_000L;
     private static final int CHANGE_FLUSH_BPM = 3;
     private static final Pattern COLLECTOR_ID = Pattern.compile("\"collector_id\"\\s*:\\s*\"([^\"]+)\"");
     private static final Pattern COLLECTOR_TOKEN = Pattern.compile("\"collector_token\"\\s*:\\s*\"([^\"]+)\"");
@@ -29,6 +30,7 @@ public final class HeartwithUploader {
     private long seq = 1;
     private long lastFlushMs;
     private long nextUploadAttemptMs;
+    private long retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
     private int lastUploadedBpm = -1;
     private boolean uploadInFlight;
     private boolean delayedFlushScheduled;
@@ -54,8 +56,16 @@ public final class HeartwithUploader {
                 || !next.clientPlatform.equals(config.clientPlatform)) {
             session = null;
             seq = 1;
+            retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
+            nextUploadAttemptMs = 0L;
+            if (HeartwithUploaderDebug.ENABLED) {
+                HeartwithUploaderDebug.log("config changed; reset session");
+            }
         }
         config = next;
+        if (next.enabled && !samples.isEmpty()) {
+            scheduleDelayedFlush(1_000L);
+        }
     }
 
     public synchronized void setStatusListener(HeartwithUploadStatusListener listener) {
@@ -89,7 +99,7 @@ public final class HeartwithUploader {
         trim(now);
         if (!shouldFlush(now, bpm) || uploadInFlight || now < nextUploadAttemptMs) {
             notifyStatus("已缓存心率，等待批量上传");
-            scheduleDelayedFlush();
+            scheduleDelayedFlush(nextFlushDelayMs(now));
             return;
         }
         flushLocked();
@@ -101,7 +111,7 @@ public final class HeartwithUploader {
             return;
         }
         if (uploadInFlight || System.currentTimeMillis() < nextUploadAttemptMs) {
-            scheduleDelayedFlush();
+            scheduleDelayedFlush(nextFlushDelayMs(System.currentTimeMillis()));
             return;
         }
         flushLocked();
@@ -112,7 +122,9 @@ public final class HeartwithUploader {
         try {
             if (config == null) {
                 notifyStatus("上传配置未就绪，继续缓存");
-                scheduleDelayedFlush();
+                if (HeartwithUploaderDebug.ENABLED) {
+                    HeartwithUploaderDebug.log("upload config unavailable; cache samples");
+                }
                 return;
             }
             if (!config.enabled) {
@@ -140,12 +152,20 @@ public final class HeartwithUploader {
             samples.clear();
             lastFlushMs = System.currentTimeMillis();
             nextUploadAttemptMs = 0L;
+            retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
             notifyStatus("上传成功 " + sampleCount + " 条 · seq " + seq);
+            if (HeartwithUploaderDebug.ENABLED) {
+                HeartwithUploaderDebug.log("upload ok: samples=" + sampleCount + ", seq=" + seq);
+            }
             seq += 1;
         } catch (Throwable throwable) {
-            nextUploadAttemptMs = System.currentTimeMillis() + RETRY_BACKOFF_MS;
+            nextUploadAttemptMs = System.currentTimeMillis() + retryBackoffMs;
+            retryBackoffMs = Math.min(MAX_RETRY_BACKOFF_MS, retryBackoffMs * 2L);
             notifyStatus("上传失败：" + throwable.getClass().getSimpleName() + " · 已缓存 " + samples.size() + " 条");
-            scheduleDelayedFlush();
+            if (HeartwithUploaderDebug.ENABLED) {
+                HeartwithUploaderDebug.log("upload failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
+            scheduleDelayedFlush(nextFlushDelayMs(System.currentTimeMillis()));
         } finally {
             uploadInFlight = false;
         }
@@ -176,6 +196,9 @@ public final class HeartwithUploader {
         }
         session = new Session(collectorId, token);
         notifyStatus("会话已创建，等待上传");
+        if (HeartwithUploaderDebug.ENABLED) {
+            HeartwithUploaderDebug.log("session created: collector=" + collectorId);
+        }
     }
 
     private boolean shouldFlush(long now, int bpm) {
@@ -195,7 +218,14 @@ public final class HeartwithUploader {
         return lastUploadedBpm > 0 && Math.abs(bpm - lastUploadedBpm) >= CHANGE_FLUSH_BPM;
     }
 
-    private void scheduleDelayedFlush() {
+    private long nextFlushDelayMs(long now) {
+        if (nextUploadAttemptMs > now) {
+            return Math.max(1_000L, Math.min(MAX_RETRY_BACKOFF_MS, nextUploadAttemptMs - now));
+        }
+        return MAX_BATCH_WINDOW_MS;
+    }
+
+    private void scheduleDelayedFlush(long delayMs) {
         if (delayedFlushScheduled || samples.isEmpty()) {
             return;
         }
@@ -206,7 +236,7 @@ public final class HeartwithUploader {
                 delayedFlushScheduled = false;
                 flush();
             }
-        }, MAX_BATCH_WINDOW_MS);
+        }, Math.max(1_000L, delayMs));
     }
 
     private byte[] buildBatchCbor(String collectorId, long packetSeq, HeartwithUploadConfig uploadConfig) {
