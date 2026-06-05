@@ -25,6 +25,7 @@ public final class HeartwithUploader {
     private final HeartwithHttpClient httpClient;
     private final Handler handler;
     private final ArrayDeque<Sample> samples = new ArrayDeque<>();
+    private HeartwithSleepStatus pendingSleepStatus;
     private HeartwithUploadConfig config;
     private HeartwithUploadStatusListener statusListener;
     private Session session;
@@ -66,7 +67,7 @@ public final class HeartwithUploader {
             }
         }
         config = next;
-        if (next.enabled && !samples.isEmpty()) {
+        if (next.enabled && hasPendingUpload()) {
             scheduleDelayedFlush(1_000L);
         }
     }
@@ -93,6 +94,18 @@ public final class HeartwithUploader {
         });
     }
 
+    public void submitSleepStatus(final HeartwithSleepStatus status) {
+        if (status == null) {
+            return;
+        }
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                onSleepStatus(status);
+            }
+        });
+    }
+
     private synchronized void onHeartRate(int bpm, long timestampMs, Integer rssi, String source) {
         if (bpm < 30 || bpm > 240) {
             return;
@@ -108,9 +121,20 @@ public final class HeartwithUploader {
         flushLocked();
     }
 
+    private synchronized void onSleepStatus(HeartwithSleepStatus status) {
+        pendingSleepStatus = status;
+        trim(System.currentTimeMillis());
+        if (uploadInFlight || System.currentTimeMillis() < nextUploadAttemptMs) {
+            notifyStatus("已缓存睡眠状态，等待上传");
+            scheduleDelayedFlush(nextFlushDelayMs(System.currentTimeMillis()));
+            return;
+        }
+        flushLocked();
+    }
+
     private synchronized void flushLockedEntry() {
         trim(System.currentTimeMillis());
-        if (samples.isEmpty()) {
+        if (!hasPendingUpload()) {
             return;
         }
         if (uploadInFlight || System.currentTimeMillis() < nextUploadAttemptMs) {
@@ -131,16 +155,17 @@ public final class HeartwithUploader {
                 return;
             }
             if (!config.enabled) {
-                clearSamplesAndCancelDelayedFlush();
+                clearUploadedAndCancelDelayedFlush();
                 session = null;
                 notifyStatus("上传已关闭");
                 return;
             }
             ensureSession();
-            if (session == null || samples.isEmpty()) {
+            if (session == null || !hasPendingUpload()) {
                 return;
             }
             int sampleCount = samples.size();
+            boolean sleepIncluded = pendingSleepStatus != null;
             byte[] body = buildBatchCbor(session.collectorId, seq, config);
             HeartwithHttpClient.Response response = httpClient.post(
                     config.serverUrl + "/api/v1/hr/batches",
@@ -152,19 +177,25 @@ public final class HeartwithUploader {
             }
             Sample last = samples.peekLast();
             lastUploadedBpm = last == null ? lastUploadedBpm : last.bpm;
-            clearSamplesAndCancelDelayedFlush();
+            clearUploadedAndCancelDelayedFlush();
             lastFlushMs = System.currentTimeMillis();
             nextUploadAttemptMs = 0L;
             retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
-            notifyStatus("上传成功 " + sampleCount + " 条 · seq " + seq);
+            notifyStatus("上传成功 " + sampleCount + " 条"
+                    + (sleepIncluded ? " · 睡眠状态" : "")
+                    + " · seq " + seq);
             if (HeartwithUploaderDebug.ENABLED) {
-                HeartwithUploaderDebug.log("upload ok: samples=" + sampleCount + ", seq=" + seq);
+                HeartwithUploaderDebug.log("upload ok: samples=" + sampleCount
+                        + ", sleep=" + sleepIncluded
+                        + ", seq=" + seq);
             }
             seq += 1;
         } catch (Throwable throwable) {
             nextUploadAttemptMs = System.currentTimeMillis() + retryBackoffMs;
             retryBackoffMs = Math.min(MAX_RETRY_BACKOFF_MS, retryBackoffMs * 2L);
-            notifyStatus("上传失败：" + throwable.getClass().getSimpleName() + " · 已缓存 " + samples.size() + " 条");
+            notifyStatus("上传失败：" + throwable.getClass().getSimpleName() + " · 已缓存 "
+                    + samples.size() + " 条"
+                    + (pendingSleepStatus != null ? " · 睡眠状态" : ""));
             if (HeartwithUploaderDebug.ENABLED) {
                 HeartwithUploaderDebug.log("upload failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
             }
@@ -229,8 +260,11 @@ public final class HeartwithUploader {
         if (nextUploadAttemptMs > now) {
             return Math.max(1_000L, Math.min(MAX_RETRY_BACKOFF_MS, nextUploadAttemptMs - now));
         }
-        if (samples.isEmpty()) {
+        if (!hasPendingUpload()) {
             return MAX_BATCH_WINDOW_MS;
+        }
+        if (samples.isEmpty()) {
+            return 1_000L;
         }
         long sinceLastFlush = lastFlushMs <= 0L ? 0L : now - lastFlushMs;
         if (lastUploadedBpm <= 0) {
@@ -246,7 +280,7 @@ public final class HeartwithUploader {
     }
 
     private void scheduleDelayedFlush(long delayMs) {
-        if (samples.isEmpty()) {
+        if (!hasPendingUpload()) {
             return;
         }
         long normalizedDelayMs = relaxedFlushDelayMs(delayMs);
@@ -295,7 +329,8 @@ public final class HeartwithUploader {
     private byte[] buildBatchCbor(String collectorId, long packetSeq, HeartwithUploadConfig uploadConfig) {
         long sentAtMs = System.currentTimeMillis();
         Cbor cbor = new Cbor();
-        cbor.map(8);
+        HeartwithSleepStatus sleepStatus = pendingSleepStatus;
+        cbor.map(sleepStatus == null ? 8 : 9);
         cbor.text("schema").uint(1);
         cbor.text("collector_id").text(collectorId);
         cbor.text("seq").uint(packetSeq);
@@ -315,7 +350,52 @@ public final class HeartwithUploader {
         if (hasRssi) {
             cbor.text("rssi").sint(last.rssi);
         }
+        if (sleepStatus != null) {
+            cbor.text("sleep");
+            writeSleepStatus(cbor, sleepStatus);
+        }
         return cbor.bytes();
+    }
+
+    private void writeSleepStatus(Cbor cbor, HeartwithSleepStatus sleep) {
+        int size = 4;
+        if (sleep.bedAtMs > 0L) size += 1;
+        if (sleep.sleepAtMs > 0L) size += 1;
+        if (sleep.wakeAtMs > 0L) size += 1;
+        if (sleep.goBedAtMs > 0L) size += 1;
+        if (sleep.deviceBedAtMs > 0L) size += 1;
+        if (sleep.leaveBedAtMs > 0L) size += 1;
+        if (sleep.deviceWakeAtMs > 0L) size += 1;
+        if (sleep.durationMinutes > 0L) size += 1;
+        cbor.map(size);
+        cbor.text("state").text(sleep.state);
+        cbor.text("observed_at_ms").uint(sleep.observedAtMs);
+        cbor.text("source").text(sleep.source);
+        cbor.text("stable").bool(sleep.stable);
+        if (sleep.bedAtMs > 0L) {
+            cbor.text("bed_at_ms").uint(sleep.bedAtMs);
+        }
+        if (sleep.sleepAtMs > 0L) {
+            cbor.text("sleep_at_ms").uint(sleep.sleepAtMs);
+        }
+        if (sleep.wakeAtMs > 0L) {
+            cbor.text("wake_at_ms").uint(sleep.wakeAtMs);
+        }
+        if (sleep.goBedAtMs > 0L) {
+            cbor.text("go_bed_at_ms").uint(sleep.goBedAtMs);
+        }
+        if (sleep.deviceBedAtMs > 0L) {
+            cbor.text("device_bed_at_ms").uint(sleep.deviceBedAtMs);
+        }
+        if (sleep.leaveBedAtMs > 0L) {
+            cbor.text("leave_bed_at_ms").uint(sleep.leaveBedAtMs);
+        }
+        if (sleep.deviceWakeAtMs > 0L) {
+            cbor.text("device_wake_at_ms").uint(sleep.deviceWakeAtMs);
+        }
+        if (sleep.durationMinutes > 0L) {
+            cbor.text("duration_minutes").uint(sleep.durationMinutes);
+        }
     }
 
     private void trim(long now) {
@@ -332,8 +412,13 @@ public final class HeartwithUploader {
         }
     }
 
-    private void clearSamplesAndCancelDelayedFlush() {
+    private boolean hasPendingUpload() {
+        return !samples.isEmpty() || pendingSleepStatus != null;
+    }
+
+    private void clearUploadedAndCancelDelayedFlush() {
         samples.clear();
+        pendingSleepStatus = null;
         delayedFlushGeneration++;
         delayedFlushScheduled = false;
         delayedFlushDueElapsedMs = 0L;
@@ -393,6 +478,11 @@ public final class HeartwithUploader {
             byte[] bytes = (value == null ? "" : value).getBytes(StandardCharsets.UTF_8);
             typeAndValue(3, bytes.length);
             out.write(bytes, 0, bytes.length);
+            return this;
+        }
+
+        Cbor bool(boolean value) {
+            out.write(value ? 0xf5 : 0xf4);
             return this;
         }
 
