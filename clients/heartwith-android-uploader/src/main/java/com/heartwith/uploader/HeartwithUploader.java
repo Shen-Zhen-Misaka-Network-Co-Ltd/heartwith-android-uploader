@@ -367,6 +367,7 @@ public final class HeartwithUploader {
         if (sleep.leaveBedAtMs > 0L) size += 1;
         if (sleep.deviceWakeAtMs > 0L) size += 1;
         if (sleep.durationMinutes > 0L) size += 1;
+        if (!sleep.segments.isEmpty()) size += 1;
         cbor.map(size);
         cbor.text("state").text(sleep.state);
         cbor.text("observed_at_ms").uint(sleep.observedAtMs);
@@ -395,6 +396,61 @@ public final class HeartwithUploader {
         }
         if (sleep.durationMinutes > 0L) {
             cbor.text("duration_minutes").uint(sleep.durationMinutes);
+        }
+        if (!sleep.segments.isEmpty()) {
+            cbor.text("segments").array(sleep.segments.size());
+            for (HeartwithSleepStatus.Segment segment : sleep.segments) {
+                writeSleepSegment(cbor, segment);
+            }
+        }
+    }
+
+    private void writeSleepSegment(Cbor cbor, HeartwithSleepStatus.Segment segment) {
+        int size = 0;
+        if (segment.bedAtMs > 0L) size += 1;
+        if (segment.wakeAtMs > 0L) size += 1;
+        if (segment.deviceBedAtMs > 0L) size += 1;
+        if (segment.deviceWakeAtMs > 0L) size += 1;
+        if (segment.durationMinutes > 0L) size += 1;
+        if (segment.deepMinutes > 0L) size += 1;
+        if (segment.lightMinutes > 0L) size += 1;
+        if (segment.remMinutes > 0L) size += 1;
+        if (segment.awakeMinutes > 0L) size += 1;
+        if (segment.awakeCount > 0L) size += 1;
+        if (segment.score > 0L) size += 1;
+        cbor.map(size);
+        if (segment.bedAtMs > 0L) {
+            cbor.text("bed_at_ms").uint(segment.bedAtMs);
+        }
+        if (segment.wakeAtMs > 0L) {
+            cbor.text("wake_at_ms").uint(segment.wakeAtMs);
+        }
+        if (segment.deviceBedAtMs > 0L) {
+            cbor.text("device_bed_at_ms").uint(segment.deviceBedAtMs);
+        }
+        if (segment.deviceWakeAtMs > 0L) {
+            cbor.text("device_wake_at_ms").uint(segment.deviceWakeAtMs);
+        }
+        if (segment.durationMinutes > 0L) {
+            cbor.text("duration_minutes").uint(segment.durationMinutes);
+        }
+        if (segment.deepMinutes > 0L) {
+            cbor.text("deep_minutes").uint(segment.deepMinutes);
+        }
+        if (segment.lightMinutes > 0L) {
+            cbor.text("light_minutes").uint(segment.lightMinutes);
+        }
+        if (segment.remMinutes > 0L) {
+            cbor.text("rem_minutes").uint(segment.remMinutes);
+        }
+        if (segment.awakeMinutes > 0L) {
+            cbor.text("awake_minutes").uint(segment.awakeMinutes);
+        }
+        if (segment.awakeCount > 0L) {
+            cbor.text("awake_count").uint(segment.awakeCount);
+        }
+        if (segment.score > 0L) {
+            cbor.text("score").uint(segment.score);
         }
     }
 
