@@ -38,6 +38,7 @@ public final class HeartwithUploader {
     private boolean delayedFlushScheduled;
     private long delayedFlushDueElapsedMs;
     private int delayedFlushGeneration;
+    private boolean closed;
 
     public HeartwithUploader(Executor worker) {
         this(worker, new UrlConnectionHeartwithHttpClient());
@@ -50,7 +51,7 @@ public final class HeartwithUploader {
     }
 
     public synchronized void configure(HeartwithUploadConfig next) {
-        if (next == null) {
+        if (closed || next == null) {
             return;
         }
         if (config == null
@@ -73,10 +74,34 @@ public final class HeartwithUploader {
     }
 
     public synchronized void setStatusListener(HeartwithUploadStatusListener listener) {
+        if (closed) {
+            return;
+        }
         statusListener = listener;
     }
 
+    /**
+     * Stops this uploader generation and cancels its main-thread flush callbacks.
+     * A new module generation must create a new uploader instance.
+     */
+    public synchronized void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        delayedFlushGeneration++;
+        delayedFlushScheduled = false;
+        delayedFlushDueElapsedMs = 0L;
+        handler.removeCallbacksAndMessages(null);
+        statusListener = null;
+    }
+
     public void submitHeartRate(final int bpm, final long timestampMs, final Integer rssi, final String source) {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+        }
         worker.execute(new Runnable() {
             @Override
             public void run() {
@@ -86,6 +111,11 @@ public final class HeartwithUploader {
     }
 
     public void flush() {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+        }
         worker.execute(new Runnable() {
             @Override
             public void run() {
@@ -98,6 +128,11 @@ public final class HeartwithUploader {
         if (status == null) {
             return;
         }
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+        }
         worker.execute(new Runnable() {
             @Override
             public void run() {
@@ -107,7 +142,7 @@ public final class HeartwithUploader {
     }
 
     private synchronized void onHeartRate(int bpm, long timestampMs, Integer rssi, String source) {
-        if (bpm < 30 || bpm > 240) {
+        if (closed || bpm < 30 || bpm > 240) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -122,6 +157,9 @@ public final class HeartwithUploader {
     }
 
     private synchronized void onSleepStatus(HeartwithSleepStatus status) {
+        if (closed) {
+            return;
+        }
         pendingSleepStatus = status;
         trim(System.currentTimeMillis());
         if (uploadInFlight || System.currentTimeMillis() < nextUploadAttemptMs) {
@@ -133,6 +171,9 @@ public final class HeartwithUploader {
     }
 
     private synchronized void flushLockedEntry() {
+        if (closed) {
+            return;
+        }
         trim(System.currentTimeMillis());
         if (!hasPendingUpload()) {
             return;
@@ -145,6 +186,9 @@ public final class HeartwithUploader {
     }
 
     private void flushLocked() {
+        if (closed) {
+            return;
+        }
         uploadInFlight = true;
         try {
             if (config == null) {
@@ -280,7 +324,7 @@ public final class HeartwithUploader {
     }
 
     private void scheduleDelayedFlush(long delayMs) {
-        if (!hasPendingUpload()) {
+        if (closed || !hasPendingUpload()) {
             return;
         }
         long normalizedDelayMs = relaxedFlushDelayMs(delayMs);
@@ -310,7 +354,7 @@ public final class HeartwithUploader {
     }
 
     private synchronized void flushDelayedEntry(int generation) {
-        if (generation != delayedFlushGeneration) {
+        if (closed || generation != delayedFlushGeneration) {
             return;
         }
         delayedFlushScheduled = false;
