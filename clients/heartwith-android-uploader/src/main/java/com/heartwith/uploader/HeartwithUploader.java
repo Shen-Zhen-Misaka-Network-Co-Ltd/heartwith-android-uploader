@@ -17,6 +17,8 @@ public final class HeartwithUploader {
     private static final long OFFLINE_CACHE_MS = 300_000L;
     private static final long INITIAL_RETRY_BACKOFF_MS = 15_000L;
     private static final long MAX_RETRY_BACKOFF_MS = 120_000L;
+    private static final long MAX_CLIENT_ERROR_BACKOFF_MS = 900_000L;
+    private static final long MAX_SESSION_RETRY_BACKOFF_MS = 600_000L;
     private static final int CHANGE_FLUSH_BPM = 3;
     private static final Pattern COLLECTOR_ID = Pattern.compile("\"collector_id\"\\s*:\\s*\"([^\"]+)\"");
     private static final Pattern COLLECTOR_TOKEN = Pattern.compile("\"collector_token\"\\s*:\\s*\"([^\"]+)\"");
@@ -33,6 +35,8 @@ public final class HeartwithUploader {
     private long lastFlushMs;
     private long nextUploadAttemptMs;
     private long retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
+    private long nextSessionAttemptMs;
+    private int sessionFailureCount;
     private int lastUploadedBpm = -1;
     private boolean uploadInFlight;
     private boolean delayedFlushScheduled;
@@ -63,6 +67,8 @@ public final class HeartwithUploader {
             seq = 1;
             retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
             nextUploadAttemptMs = 0L;
+            nextSessionAttemptMs = 0L;
+            sessionFailureCount = 0;
             if (HeartwithUploaderDebug.ENABLED) {
                 HeartwithUploaderDebug.log("config changed; reset session");
             }
@@ -205,7 +211,15 @@ public final class HeartwithUploader {
                 return;
             }
             ensureSession();
-            if (session == null || !hasPendingUpload()) {
+            if (session == null) {
+                long gatedNow = System.currentTimeMillis();
+                if (nextSessionAttemptMs > gatedNow) {
+                    nextUploadAttemptMs = nextSessionAttemptMs;
+                    scheduleDelayedFlush(nextFlushDelayMs(gatedNow));
+                }
+                return;
+            }
+            if (!hasPendingUpload()) {
                 return;
             }
             int sampleCount = samples.size();
@@ -217,7 +231,7 @@ public final class HeartwithUploader {
                     body,
                     "Bearer " + session.collectorToken);
             if (!response.isSuccessful()) {
-                throw new IllegalStateException("batch http " + response.code);
+                throw new HttpStatusException("batch http " + response.code, response.code);
             }
             Sample last = samples.peekLast();
             lastUploadedBpm = last == null ? lastUploadedBpm : last.bpm;
@@ -225,6 +239,8 @@ public final class HeartwithUploader {
             lastFlushMs = System.currentTimeMillis();
             nextUploadAttemptMs = 0L;
             retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
+            nextSessionAttemptMs = 0L;
+            sessionFailureCount = 0;
             notifyStatus("上传成功 " + sampleCount + " 条"
                     + (sleepIncluded ? " · 睡眠状态" : "")
                     + " · seq " + seq);
@@ -235,13 +251,33 @@ public final class HeartwithUploader {
             }
             seq += 1;
         } catch (Throwable throwable) {
-            nextUploadAttemptMs = System.currentTimeMillis() + retryBackoffMs;
-            retryBackoffMs = Math.min(MAX_RETRY_BACKOFF_MS, retryBackoffMs * 2L);
-            notifyStatus("上传失败：" + throwable.getClass().getSimpleName() + " · 已缓存 "
-                    + samples.size() + " 条"
+            int httpCode = throwable instanceof HttpStatusException ? ((HttpStatusException) throwable).code : 0;
+            long failureNowMs = System.currentTimeMillis();
+            if (httpCode == 401 || httpCode == 403) {
+                boolean invalidatedEstablishedSession = session != null;
+                session = null;
+                seq = 1;
+                if (invalidatedEstablishedSession) {
+                    backoffSession();
+                }
+                retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
+                nextUploadAttemptMs = Math.max(
+                        failureNowMs + INITIAL_RETRY_BACKOFF_MS, nextSessionAttemptMs);
+            } else if (session == null && nextSessionAttemptMs > failureNowMs) {
+                nextUploadAttemptMs = nextSessionAttemptMs;
+            } else {
+                long maxBackoffMs = shouldUseLongClientErrorBackoff(httpCode)
+                        ? MAX_CLIENT_ERROR_BACKOFF_MS : MAX_RETRY_BACKOFF_MS;
+                retryBackoffMs = Math.min(retryBackoffMs, maxBackoffMs);
+                nextUploadAttemptMs = failureNowMs + retryBackoffMs;
+                retryBackoffMs = Math.min(maxBackoffMs, retryBackoffMs * 2L);
+            }
+            notifyStatus("上传失败：" + (httpCode > 0 ? "HTTP " + httpCode : throwable.getClass().getSimpleName())
+                    + " · 已缓存 " + samples.size() + " 条"
                     + (pendingSleepStatus != null ? " · 睡眠状态" : ""));
             if (HeartwithUploaderDebug.ENABLED) {
-                HeartwithUploaderDebug.log("upload failed: " + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+                HeartwithUploaderDebug.log("upload failed: " + throwable.getClass().getSimpleName()
+                        + (httpCode > 0 ? " http=" + httpCode : "") + ": " + throwable.getMessage());
             }
             scheduleDelayedFlush(nextFlushDelayMs(System.currentTimeMillis()));
         } finally {
@@ -253,30 +289,54 @@ public final class HeartwithUploader {
         if (session != null) {
             return;
         }
-        String json = "{"
-                + "\"display_name\":\"" + escapeJson(config.displayName) + "\","
-                + "\"device_model\":\"" + escapeJson(config.deviceModel) + "\","
-                + "\"client_platform\":\"" + escapeJson(config.clientPlatform) + "\","
-                + "\"app_version\":\"" + escapeJson(config.appVersion) + "\""
-                + "}";
-        HeartwithHttpClient.Response response = httpClient.post(
-                config.serverUrl + "/api/v1/collector/sessions",
-                "application/json; charset=utf-8",
-                json.getBytes(StandardCharsets.UTF_8),
-                null);
-        if (!response.isSuccessful()) {
-            throw new IllegalStateException("session http " + response.code);
+        if (System.currentTimeMillis() < nextSessionAttemptMs) {
+            return;
         }
-        String collectorId = match(response.body, COLLECTOR_ID);
-        String token = match(response.body, COLLECTOR_TOKEN);
-        if (collectorId == null || token == null) {
-            throw new IllegalStateException("session response missing credentials");
+        try {
+            String json = "{"
+                    + "\"display_name\":\"" + escapeJson(config.displayName) + "\","
+                    + "\"device_model\":\"" + escapeJson(config.deviceModel) + "\","
+                    + "\"client_platform\":\"" + escapeJson(config.clientPlatform) + "\","
+                    + "\"app_version\":\"" + escapeJson(config.appVersion) + "\""
+                    + "}";
+            HeartwithHttpClient.Response response = httpClient.post(
+                    config.serverUrl + "/api/v1/collector/sessions",
+                    "application/json; charset=utf-8",
+                    json.getBytes(StandardCharsets.UTF_8),
+                    null);
+            if (!response.isSuccessful()) {
+                throw new HttpStatusException("session http " + response.code, response.code);
+            }
+            String collectorId = match(response.body, COLLECTOR_ID);
+            String token = match(response.body, COLLECTOR_TOKEN);
+            if (collectorId == null || token == null) {
+                throw new IllegalStateException("session response missing credentials");
+            }
+            session = new Session(collectorId, token);
+            nextSessionAttemptMs = 0L;
+            notifyStatus("会话已创建，等待上传");
+            if (HeartwithUploaderDebug.ENABLED) {
+                HeartwithUploaderDebug.log("session created: collector=" + collectorId);
+            }
+        } catch (Exception exception) {
+            backoffSession();
+            throw exception;
         }
-        session = new Session(collectorId, token);
-        notifyStatus("会话已创建，等待上传");
-        if (HeartwithUploaderDebug.ENABLED) {
-            HeartwithUploaderDebug.log("session created: collector=" + collectorId);
-        }
+    }
+
+    private void backoffSession() {
+        sessionFailureCount += 1;
+        nextSessionAttemptMs = System.currentTimeMillis() + sessionBackoffDelayMs(sessionFailureCount);
+    }
+
+    static long sessionBackoffDelayMs(int failureCount) {
+        int exponent = Math.min(6, Math.max(0, failureCount - 1));
+        long backoffMs = INITIAL_RETRY_BACKOFF_MS * (1L << exponent);
+        return Math.min(MAX_SESSION_RETRY_BACKOFF_MS, backoffMs);
+    }
+
+    static boolean shouldUseLongClientErrorBackoff(int httpCode) {
+        return httpCode >= 400 && httpCode < 500 && httpCode != 408 && httpCode != 429;
     }
 
     private boolean shouldFlush(long now, int bpm) {
@@ -302,7 +362,7 @@ public final class HeartwithUploader {
 
     private long nextFlushDelayMs(long now) {
         if (nextUploadAttemptMs > now) {
-            return Math.max(1_000L, Math.min(MAX_RETRY_BACKOFF_MS, nextUploadAttemptMs - now));
+            return Math.max(1_000L, Math.min(MAX_CLIENT_ERROR_BACKOFF_MS, nextUploadAttemptMs - now));
         }
         if (!hasPendingUpload()) {
             return MAX_BATCH_WINDOW_MS;
@@ -531,6 +591,15 @@ public final class HeartwithUploader {
 
     private String escapeJson(String value) {
         return value == null ? "" : value.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static final class HttpStatusException extends Exception {
+        final int code;
+
+        HttpStatusException(String message, int code) {
+            super(message);
+            this.code = code;
+        }
     }
 
     private static final class Session {
