@@ -23,5 +23,8 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - name: Test upload retries and batching
+        run: ./gradlew :heartwith-android-uploader:testDebugUnitTest --warning-mode=fail
+
       - name: Build
         run: ./gradlew :heartwith-android-uploader:assembleRelease --warning-mode=fail
