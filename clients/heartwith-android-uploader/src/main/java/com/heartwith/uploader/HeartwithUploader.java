@@ -2,19 +2,36 @@ package com.heartwith.uploader;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * Batches heart-rate samples and sleep status and uploads them.
+ *
+ * <p>Threading: all network I/O runs on {@code worker} (expected to be a single-thread
+ * executor) without holding this object's monitor, so {@link #configure}, {@link #close}
+ * and the {@code submit*} entry points never wait on a slow server.
+ *
+ * <p>Delivery: a batch is frozen (seq + samples + sleep status) before its first attempt and
+ * retried unchanged, so a batch whose response was lost is deduplicated by the server as a
+ * whole and samples that arrived meanwhile always travel in a later batch. Seqs are derived
+ * from wall-clock time, so they stay unique across processes and restarts.
+ */
 public final class HeartwithUploader {
     private static final long MIN_BATCH_WINDOW_MS = 8_000L;
     private static final long MAX_BATCH_WINDOW_MS = 30_000L;
     private static final long FLUSH_TIMER_SLACK_MS = 5_000L;
-    private static final long OFFLINE_CACHE_MS = 300_000L;
+    static final long OFFLINE_CACHE_MS = 6L * 60L * 60_000L;
+    static final int MAX_QUEUED_SAMPLES = 30_000;
+    static final int MAX_BATCH_SAMPLES = 600;
     private static final long INITIAL_RETRY_BACKOFF_MS = 15_000L;
     private static final long MAX_RETRY_BACKOFF_MS = 120_000L;
     private static final long MAX_CLIENT_ERROR_BACKOFF_MS = 900_000L;
@@ -26,12 +43,14 @@ public final class HeartwithUploader {
     private final Executor worker;
     private final HeartwithHttpClient httpClient;
     private final Handler handler;
+    private final long seqSalt;
     private final ArrayDeque<Sample> samples = new ArrayDeque<>();
     private HeartwithSleepStatus pendingSleepStatus;
+    private FrozenBatch frozenBatch;
     private HeartwithUploadConfig config;
     private HeartwithUploadStatusListener statusListener;
     private Session session;
-    private long seq = 1;
+    private long lastSeq;
     private long lastFlushMs;
     private long nextUploadAttemptMs;
     private long retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
@@ -42,6 +61,7 @@ public final class HeartwithUploader {
     private boolean delayedFlushScheduled;
     private long delayedFlushDueElapsedMs;
     private int delayedFlushGeneration;
+    private int droppedSamples;
     private boolean closed;
 
     public HeartwithUploader(Executor worker) {
@@ -52,6 +72,7 @@ public final class HeartwithUploader {
         this.worker = worker;
         this.httpClient = httpClient;
         this.handler = new Handler(Looper.getMainLooper());
+        this.seqSalt = android.os.Process.myPid() & 7L;
     }
 
     public synchronized void configure(HeartwithUploadConfig next) {
@@ -64,7 +85,6 @@ public final class HeartwithUploader {
                 || !next.deviceModel.equals(config.deviceModel)
                 || !next.clientPlatform.equals(config.clientPlatform)) {
             session = null;
-            seq = 1;
             retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
             nextUploadAttemptMs = 0L;
             nextSessionAttemptMs = 0L;
@@ -90,23 +110,23 @@ public final class HeartwithUploader {
      * Stops this uploader generation and cancels its main-thread flush callbacks.
      * A new module generation must create a new uploader instance.
      */
-    public synchronized void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
-        delayedFlushGeneration++;
-        delayedFlushScheduled = false;
-        delayedFlushDueElapsedMs = 0L;
-        handler.removeCallbacksAndMessages(null);
-        statusListener = null;
-    }
-
-    public void submitHeartRate(final int bpm, final long timestampMs, final Integer rssi, final String source) {
+    public void close() {
         synchronized (this) {
             if (closed) {
                 return;
             }
+            closed = true;
+            delayedFlushGeneration++;
+            delayedFlushScheduled = false;
+            delayedFlushDueElapsedMs = 0L;
+            handler.removeCallbacksAndMessages(null);
+            statusListener = null;
+        }
+    }
+
+    public void submitHeartRate(final int bpm, final long timestampMs, final Integer rssi, final String source) {
+        if (isClosed()) {
+            return;
         }
         worker.execute(new Runnable() {
             @Override
@@ -117,27 +137,20 @@ public final class HeartwithUploader {
     }
 
     public void flush() {
-        synchronized (this) {
-            if (closed) {
-                return;
-            }
+        if (isClosed()) {
+            return;
         }
         worker.execute(new Runnable() {
             @Override
             public void run() {
-                flushLockedEntry();
+                flushEntry(false);
             }
         });
     }
 
     public void submitSleepStatus(final HeartwithSleepStatus status) {
-        if (status == null) {
+        if (status == null || isClosed()) {
             return;
-        }
-        synchronized (this) {
-            if (closed) {
-                return;
-            }
         }
         worker.execute(new Runnable() {
             @Override
@@ -147,180 +160,264 @@ public final class HeartwithUploader {
         });
     }
 
-    private synchronized void onHeartRate(int bpm, long timestampMs, Integer rssi, String source) {
-        if (closed || bpm < 30 || bpm > 240) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        samples.addLast(new Sample(timestampMs > 0 ? timestampMs : now, bpm, rssi, source));
-        trim(now);
-        if (!shouldFlush(now, bpm) || uploadInFlight || now < nextUploadAttemptMs) {
-            notifyStatus("已缓存心率，等待批量上传");
-            scheduleDelayedFlush(nextFlushDelayMs(now));
-            return;
-        }
-        flushLocked();
+    private synchronized boolean isClosed() {
+        return closed;
     }
 
-    private synchronized void onSleepStatus(HeartwithSleepStatus status) {
-        if (closed) {
-            return;
+    private void onHeartRate(int bpm, long timestampMs, Integer rssi, String source) {
+        boolean flushNow;
+        synchronized (this) {
+            if (closed || bpm < 30 || bpm > 240) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            samples.addLast(new Sample(timestampMs > 0 ? timestampMs : now, bpm, rssi, source));
+            trim(now);
+            flushNow = shouldFlush(now, bpm) && !uploadInFlight && now >= nextUploadAttemptMs;
+            if (!flushNow) {
+                notifyStatus("已缓存心率，等待批量上传");
+                scheduleDelayedFlush(nextFlushDelayMs(now));
+                return;
+            }
         }
-        pendingSleepStatus = status;
-        trim(System.currentTimeMillis());
-        if (uploadInFlight || System.currentTimeMillis() < nextUploadAttemptMs) {
-            notifyStatus("已缓存睡眠状态，等待上传");
-            scheduleDelayedFlush(nextFlushDelayMs(System.currentTimeMillis()));
-            return;
-        }
-        flushLocked();
+        uploadOnce();
     }
 
-    private synchronized void flushLockedEntry() {
-        if (closed) {
-            return;
+    private void onSleepStatus(HeartwithSleepStatus status) {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            pendingSleepStatus = status;
+            long now = System.currentTimeMillis();
+            trim(now);
+            if (uploadInFlight || now < nextUploadAttemptMs) {
+                notifyStatus("已缓存睡眠状态，等待上传");
+                scheduleDelayedFlush(nextFlushDelayMs(now));
+                return;
+            }
         }
-        trim(System.currentTimeMillis());
-        if (!hasPendingUpload()) {
-            return;
-        }
-        if (uploadInFlight || System.currentTimeMillis() < nextUploadAttemptMs) {
-            scheduleDelayedFlush(nextFlushDelayMs(System.currentTimeMillis()));
-            return;
-        }
-        flushLocked();
+        uploadOnce();
     }
 
-    private void flushLocked() {
-        if (closed) {
-            return;
-        }
-        uploadInFlight = true;
-        try {
-            if (config == null) {
-                notifyStatus("上传配置未就绪，继续缓存");
-                if (HeartwithUploaderDebug.ENABLED) {
-                    HeartwithUploaderDebug.log("upload config unavailable; cache samples");
-                }
+    private void flushEntry(boolean delayed) {
+        synchronized (this) {
+            if (closed) {
                 return;
             }
-            if (!config.enabled) {
-                clearUploadedAndCancelDelayedFlush();
-                session = null;
-                notifyStatus("上传已关闭");
-                return;
-            }
-            ensureSession();
-            if (session == null) {
-                long gatedNow = System.currentTimeMillis();
-                if (nextSessionAttemptMs > gatedNow) {
-                    nextUploadAttemptMs = nextSessionAttemptMs;
-                    scheduleDelayedFlush(nextFlushDelayMs(gatedNow));
-                }
-                return;
-            }
+            long now = System.currentTimeMillis();
+            trim(now);
             if (!hasPendingUpload()) {
                 return;
             }
-            int sampleCount = samples.size();
-            boolean sleepIncluded = pendingSleepStatus != null;
-            byte[] body = buildBatchCbor(session.collectorId, seq, config);
+            if (uploadInFlight || now < nextUploadAttemptMs) {
+                scheduleDelayedFlush(nextFlushDelayMs(now));
+                return;
+            }
+        }
+        uploadOnce();
+    }
+
+    /** One upload attempt: prepare under the lock, do network I/O unlocked, commit under the lock. */
+    private void uploadOnce() {
+        Attempt attempt;
+        synchronized (this) {
+            attempt = prepareAttemptLocked();
+            if (attempt == null) {
+                return;
+            }
+            uploadInFlight = true;
+        }
+        Outcome outcome = execute(attempt);
+        synchronized (this) {
+            uploadInFlight = false;
+            if (closed) {
+                return;
+            }
+            applyOutcomeLocked(attempt, outcome);
+        }
+    }
+
+    private Attempt prepareAttemptLocked() {
+        if (closed || uploadInFlight) {
+            return null;
+        }
+        if (config == null) {
+            notifyStatus("上传配置未就绪，继续缓存");
+            if (HeartwithUploaderDebug.ENABLED) {
+                HeartwithUploaderDebug.log("upload config unavailable; cache samples");
+            }
+            return null;
+        }
+        if (!config.enabled) {
+            samples.clear();
+            pendingSleepStatus = null;
+            frozenBatch = null;
+            cancelDelayedFlushLocked();
+            session = null;
+            notifyStatus("上传已关闭");
+            return null;
+        }
+        long now = System.currentTimeMillis();
+        if (session == null && now < nextSessionAttemptMs) {
+            nextUploadAttemptMs = Math.max(nextUploadAttemptMs, nextSessionAttemptMs);
+            scheduleDelayedFlush(nextFlushDelayMs(now));
+            return null;
+        }
+        if (frozenBatch == null) {
+            if (!hasPendingSamples() && pendingSleepStatus == null) {
+                return null;
+            }
+            frozenBatch = freezeBatchLocked(now);
+        }
+        return new Attempt(config, session, frozenBatch);
+    }
+
+    private FrozenBatch freezeBatchLocked(long now) {
+        int count = Math.min(MAX_BATCH_SAMPLES, samples.size());
+        List<Sample> batchSamples = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            batchSamples.add(samples.removeFirst());
+        }
+        HeartwithSleepStatus sleep = pendingSleepStatus;
+        pendingSleepStatus = null;
+        return new FrozenBatch(nextSeqLocked(now), batchSamples, sleep);
+    }
+
+    private long nextSeqLocked(long now) {
+        long timeSeq = now * 8L + seqSalt;
+        lastSeq = Math.max(lastSeq + 1L, timeSeq);
+        return lastSeq;
+    }
+
+    private Outcome execute(Attempt attempt) {
+        Session activeSession = attempt.session;
+        boolean createdSession = false;
+        try {
+            if (activeSession == null) {
+                activeSession = createSession(attempt.config);
+                createdSession = true;
+            }
+            byte[] body = buildBatchCbor(activeSession.collectorId, attempt.batch, attempt.config);
             HeartwithHttpClient.Response response = httpClient.post(
-                    config.serverUrl + "/api/v1/hr/batches",
+                    attempt.config.serverUrl + "/api/v1/hr/batches",
                     "application/cbor",
                     body,
-                    "Bearer " + session.collectorToken);
+                    "Bearer " + activeSession.collectorToken);
             if (!response.isSuccessful()) {
                 throw new HttpStatusException("batch http " + response.code, response.code);
             }
-            Sample last = samples.peekLast();
-            lastUploadedBpm = last == null ? lastUploadedBpm : last.bpm;
-            clearUploadedAndCancelDelayedFlush();
-            lastFlushMs = System.currentTimeMillis();
+            return new Outcome(activeSession, createdSession, null);
+        } catch (Throwable throwable) {
+            return new Outcome(activeSession, createdSession, throwable);
+        }
+    }
+
+    private Session createSession(HeartwithUploadConfig uploadConfig) throws Exception {
+        String json = "{"
+                + "\"display_name\":\"" + escapeJson(uploadConfig.displayName) + "\","
+                + "\"device_model\":\"" + escapeJson(uploadConfig.deviceModel) + "\","
+                + "\"client_platform\":\"" + escapeJson(uploadConfig.clientPlatform) + "\","
+                + "\"app_version\":\"" + escapeJson(uploadConfig.appVersion) + "\""
+                + "}";
+        HeartwithHttpClient.Response response = httpClient.post(
+                uploadConfig.serverUrl + "/api/v1/collector/sessions",
+                "application/json; charset=utf-8",
+                json.getBytes(StandardCharsets.UTF_8),
+                null);
+        if (!response.isSuccessful()) {
+            throw new SessionException(new HttpStatusException("session http " + response.code, response.code));
+        }
+        String collectorId = match(response.body, COLLECTOR_ID);
+        String token = match(response.body, COLLECTOR_TOKEN);
+        if (collectorId == null || token == null) {
+            throw new SessionException(new IllegalStateException("session response missing credentials"));
+        }
+        return new Session(collectorId, token);
+    }
+
+    private void applyOutcomeLocked(Attempt attempt, Outcome outcome) {
+        boolean sameConfig = attempt.config == config;
+        long now = System.currentTimeMillis();
+        Throwable failure = outcome.failure;
+        if (failure instanceof SessionException) {
+            backoffSession();
+            Throwable cause = failure.getCause();
+            int code = cause instanceof HttpStatusException ? ((HttpStatusException) cause).code : 0;
+            nextUploadAttemptMs = nextSessionAttemptMs;
+            notifyFailure(code, cause);
+            scheduleDelayedFlush(nextFlushDelayMs(now));
+            return;
+        }
+        if (outcome.createdSession && sameConfig) {
+            session = outcome.session;
+            nextSessionAttemptMs = 0L;
+            notifyStatus("会话已创建，等待上传");
+            if (HeartwithUploaderDebug.ENABLED) {
+                HeartwithUploaderDebug.log("session created: collector=" + outcome.session.collectorId);
+            }
+        }
+        if (failure == null) {
+            FrozenBatch batch = attempt.batch;
+            if (frozenBatch == batch) {
+                frozenBatch = null;
+            }
+            if (!batch.samples.isEmpty()) {
+                lastUploadedBpm = batch.samples.get(batch.samples.size() - 1).bpm;
+            }
+            lastFlushMs = now;
             nextUploadAttemptMs = 0L;
             retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
             nextSessionAttemptMs = 0L;
             sessionFailureCount = 0;
-            notifyStatus("上传成功 " + sampleCount + " 条"
-                    + (sleepIncluded ? " · 睡眠状态" : "")
-                    + " · seq " + seq);
+            notifyStatus("上传成功 " + batch.samples.size() + " 条"
+                    + (batch.sleep != null ? " · 睡眠状态" : "")
+                    + (droppedSamples > 0 ? " · 离线溢出丢弃 " + droppedSamples + " 条" : ""));
             if (HeartwithUploaderDebug.ENABLED) {
-                HeartwithUploaderDebug.log("upload ok: samples=" + sampleCount
-                        + ", sleep=" + sleepIncluded
-                        + ", seq=" + seq);
+                HeartwithUploaderDebug.log("upload ok: samples=" + batch.samples.size()
+                        + ", sleep=" + (batch.sleep != null)
+                        + ", seq=" + batch.seq);
             }
-            seq += 1;
-        } catch (Throwable throwable) {
-            int httpCode = throwable instanceof HttpStatusException ? ((HttpStatusException) throwable).code : 0;
-            long failureNowMs = System.currentTimeMillis();
-            if (httpCode == 401 || httpCode == 403) {
-                boolean invalidatedEstablishedSession = session != null;
-                session = null;
-                seq = 1;
-                if (invalidatedEstablishedSession) {
-                    backoffSession();
-                }
-                retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
-                nextUploadAttemptMs = Math.max(
-                        failureNowMs + INITIAL_RETRY_BACKOFF_MS, nextSessionAttemptMs);
-            } else if (session == null && nextSessionAttemptMs > failureNowMs) {
-                nextUploadAttemptMs = nextSessionAttemptMs;
+            droppedSamples = 0;
+            if (hasPendingUpload()) {
+                scheduleDelayedFlush(nextFlushDelayMs(now));
             } else {
-                long maxBackoffMs = shouldUseLongClientErrorBackoff(httpCode)
-                        ? MAX_CLIENT_ERROR_BACKOFF_MS : MAX_RETRY_BACKOFF_MS;
-                retryBackoffMs = Math.min(retryBackoffMs, maxBackoffMs);
-                nextUploadAttemptMs = failureNowMs + retryBackoffMs;
-                retryBackoffMs = Math.min(maxBackoffMs, retryBackoffMs * 2L);
+                cancelDelayedFlushLocked();
             }
-            notifyStatus("上传失败：" + (httpCode > 0 ? "HTTP " + httpCode : throwable.getClass().getSimpleName())
-                    + " · 已缓存 " + samples.size() + " 条"
-                    + (pendingSleepStatus != null ? " · 睡眠状态" : ""));
-            if (HeartwithUploaderDebug.ENABLED) {
-                HeartwithUploaderDebug.log("upload failed: " + throwable.getClass().getSimpleName()
-                        + (httpCode > 0 ? " http=" + httpCode : "") + ": " + throwable.getMessage());
-            }
-            scheduleDelayedFlush(nextFlushDelayMs(System.currentTimeMillis()));
-        } finally {
-            uploadInFlight = false;
+            return;
         }
+        int httpCode = failure instanceof HttpStatusException ? ((HttpStatusException) failure).code : 0;
+        if (httpCode == 401 || httpCode == 403) {
+            boolean invalidatedEstablishedSession = session != null || outcome.createdSession;
+            session = null;
+            if (invalidatedEstablishedSession) {
+                backoffSession();
+            }
+            retryBackoffMs = INITIAL_RETRY_BACKOFF_MS;
+            nextUploadAttemptMs = Math.max(now + INITIAL_RETRY_BACKOFF_MS, nextSessionAttemptMs);
+        } else {
+            long maxBackoffMs = shouldUseLongClientErrorBackoff(httpCode)
+                    ? MAX_CLIENT_ERROR_BACKOFF_MS : MAX_RETRY_BACKOFF_MS;
+            retryBackoffMs = Math.min(retryBackoffMs, maxBackoffMs);
+            nextUploadAttemptMs = now + retryBackoffMs;
+            retryBackoffMs = Math.min(maxBackoffMs, retryBackoffMs * 2L);
+        }
+        notifyFailure(httpCode, failure);
+        scheduleDelayedFlush(nextFlushDelayMs(now));
     }
 
-    private void ensureSession() throws Exception {
-        if (session != null) {
-            return;
-        }
-        if (System.currentTimeMillis() < nextSessionAttemptMs) {
-            return;
-        }
-        try {
-            String json = "{"
-                    + "\"display_name\":\"" + escapeJson(config.displayName) + "\","
-                    + "\"device_model\":\"" + escapeJson(config.deviceModel) + "\","
-                    + "\"client_platform\":\"" + escapeJson(config.clientPlatform) + "\","
-                    + "\"app_version\":\"" + escapeJson(config.appVersion) + "\""
-                    + "}";
-            HeartwithHttpClient.Response response = httpClient.post(
-                    config.serverUrl + "/api/v1/collector/sessions",
-                    "application/json; charset=utf-8",
-                    json.getBytes(StandardCharsets.UTF_8),
-                    null);
-            if (!response.isSuccessful()) {
-                throw new HttpStatusException("session http " + response.code, response.code);
-            }
-            String collectorId = match(response.body, COLLECTOR_ID);
-            String token = match(response.body, COLLECTOR_TOKEN);
-            if (collectorId == null || token == null) {
-                throw new IllegalStateException("session response missing credentials");
-            }
-            session = new Session(collectorId, token);
-            nextSessionAttemptMs = 0L;
-            notifyStatus("会话已创建，等待上传");
-            if (HeartwithUploaderDebug.ENABLED) {
-                HeartwithUploaderDebug.log("session created: collector=" + collectorId);
-            }
-        } catch (Exception exception) {
-            backoffSession();
-            throw exception;
+    private void notifyFailure(int httpCode, Throwable throwable) {
+        int cached = samples.size() + (frozenBatch == null ? 0 : frozenBatch.samples.size());
+        boolean sleepPending = pendingSleepStatus != null || (frozenBatch != null && frozenBatch.sleep != null);
+        notifyStatus("上传失败：" + (httpCode > 0 ? "HTTP " + httpCode
+                : throwable == null ? "unknown" : throwable.getClass().getSimpleName())
+                + " · 已缓存 " + cached + " 条"
+                + (sleepPending ? " · 睡眠状态" : ""));
+        if (HeartwithUploaderDebug.ENABLED) {
+            HeartwithUploaderDebug.log("upload failed: "
+                    + (throwable == null ? "unknown" : throwable.getClass().getSimpleName())
+                    + (httpCode > 0 ? " http=" + httpCode : "")
+                    + (throwable == null ? "" : ": " + throwable.getMessage()));
         }
     }
 
@@ -367,7 +464,7 @@ public final class HeartwithUploader {
         if (!hasPendingUpload()) {
             return MAX_BATCH_WINDOW_MS;
         }
-        if (samples.isEmpty()) {
+        if (frozenBatch != null || samples.isEmpty() || samples.size() >= MAX_BATCH_SAMPLES) {
             return 1_000L;
         }
         long sinceLastFlush = lastFlushMs <= 0L ? 0L : now - lastFlushMs;
@@ -388,7 +485,7 @@ public final class HeartwithUploader {
             return;
         }
         long normalizedDelayMs = relaxedFlushDelayMs(delayMs);
-        long dueElapsedMs = android.os.SystemClock.elapsedRealtime() + normalizedDelayMs;
+        long dueElapsedMs = SystemClock.elapsedRealtime() + normalizedDelayMs;
         if (delayedFlushScheduled && dueElapsedMs >= delayedFlushDueElapsedMs - 250L) {
             return;
         }
@@ -413,13 +510,15 @@ public final class HeartwithUploader {
         }
     }
 
-    private synchronized void flushDelayedEntry(int generation) {
-        if (closed || generation != delayedFlushGeneration) {
-            return;
+    private void flushDelayedEntry(int generation) {
+        synchronized (this) {
+            if (closed || generation != delayedFlushGeneration) {
+                return;
+            }
+            delayedFlushScheduled = false;
+            delayedFlushDueElapsedMs = 0L;
         }
-        delayedFlushScheduled = false;
-        delayedFlushDueElapsedMs = 0L;
-        flushLockedEntry();
+        flushEntry(true);
     }
 
     private long relaxedFlushDelayMs(long delayMs) {
@@ -430,24 +529,31 @@ public final class HeartwithUploader {
         return baseDelayMs + Math.min(FLUSH_TIMER_SLACK_MS, Math.max(1_000L, baseDelayMs / 4L));
     }
 
-    private byte[] buildBatchCbor(String collectorId, long packetSeq, HeartwithUploadConfig uploadConfig) {
+    private void cancelDelayedFlushLocked() {
+        delayedFlushGeneration++;
+        delayedFlushScheduled = false;
+        delayedFlushDueElapsedMs = 0L;
+    }
+
+    private byte[] buildBatchCbor(String collectorId, FrozenBatch batch, HeartwithUploadConfig uploadConfig) {
+        // sent_at_ms is refreshed on every attempt so delayed retries keep exact sample times.
         long sentAtMs = System.currentTimeMillis();
         Cbor cbor = new Cbor();
-        HeartwithSleepStatus sleepStatus = pendingSleepStatus;
+        HeartwithSleepStatus sleepStatus = batch.sleep;
         cbor.map(sleepStatus == null ? 8 : 9);
         cbor.text("schema").uint(1);
         cbor.text("collector_id").text(collectorId);
-        cbor.text("seq").uint(packetSeq);
+        cbor.text("seq").uint(batch.seq);
         cbor.text("sent_at_ms").uint(sentAtMs);
         cbor.text("display_name").text(uploadConfig.displayName);
         cbor.text("device_model").text(uploadConfig.deviceModel);
-        cbor.text("samples").array(samples.size());
-        for (Sample sample : samples) {
+        cbor.text("samples").array(batch.samples.size());
+        for (Sample sample : batch.samples) {
             cbor.map(2);
             cbor.text("dt_ms").sint(sample.tMs - sentAtMs);
             cbor.text("bpm").uint(sample.bpm);
         }
-        Sample last = samples.peekLast();
+        Sample last = batch.samples.isEmpty() ? null : batch.samples.get(batch.samples.size() - 1);
         boolean hasRssi = last != null && last.rssi != null;
         cbor.text("ble").map(hasRssi ? 2 : 1);
         cbor.text("source").text(last == null ? "heartwith" : last.source);
@@ -560,8 +666,10 @@ public final class HeartwithUploader {
 
     private void trim(long now) {
         long cutoff = now - OFFLINE_CACHE_MS;
-        while (!samples.isEmpty() && samples.peekFirst().tMs < cutoff) {
+        while (!samples.isEmpty()
+                && (samples.size() > MAX_QUEUED_SAMPLES || samples.peekFirst().tMs < cutoff)) {
             samples.removeFirst();
+            droppedSamples++;
         }
     }
 
@@ -572,16 +680,12 @@ public final class HeartwithUploader {
         }
     }
 
-    private boolean hasPendingUpload() {
-        return !samples.isEmpty() || pendingSleepStatus != null;
+    private boolean hasPendingSamples() {
+        return !samples.isEmpty() || (frozenBatch != null && !frozenBatch.samples.isEmpty());
     }
 
-    private void clearUploadedAndCancelDelayedFlush() {
-        samples.clear();
-        pendingSleepStatus = null;
-        delayedFlushGeneration++;
-        delayedFlushScheduled = false;
-        delayedFlushDueElapsedMs = 0L;
+    private boolean hasPendingUpload() {
+        return !samples.isEmpty() || pendingSleepStatus != null || frozenBatch != null;
     }
 
     private String match(String value, Pattern pattern) {
@@ -616,6 +720,13 @@ public final class HeartwithUploader {
         }
     }
 
+    /** Wraps a failure that happened while creating the session, before any batch was sent. */
+    private static final class SessionException extends Exception {
+        SessionException(Throwable cause) {
+            super(cause);
+        }
+    }
+
     private static final class Session {
         final String collectorId;
         final String collectorToken;
@@ -623,6 +734,42 @@ public final class HeartwithUploader {
         Session(String collectorId, String collectorToken) {
             this.collectorId = collectorId;
             this.collectorToken = collectorToken;
+        }
+    }
+
+    private static final class FrozenBatch {
+        final long seq;
+        final List<Sample> samples;
+        final HeartwithSleepStatus sleep;
+
+        FrozenBatch(long seq, List<Sample> samples, HeartwithSleepStatus sleep) {
+            this.seq = seq;
+            this.samples = samples;
+            this.sleep = sleep;
+        }
+    }
+
+    private static final class Attempt {
+        final HeartwithUploadConfig config;
+        final Session session;
+        final FrozenBatch batch;
+
+        Attempt(HeartwithUploadConfig config, Session session, FrozenBatch batch) {
+            this.config = config;
+            this.session = session;
+            this.batch = batch;
+        }
+    }
+
+    private static final class Outcome {
+        final Session session;
+        final boolean createdSession;
+        final Throwable failure;
+
+        Outcome(Session session, boolean createdSession, Throwable failure) {
+            this.session = session;
+            this.createdSession = createdSession;
+            this.failure = failure;
         }
     }
 
