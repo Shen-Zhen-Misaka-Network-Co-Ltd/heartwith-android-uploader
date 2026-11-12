@@ -4,7 +4,11 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -32,11 +36,13 @@ public final class HeartwithUploader {
     static final long OFFLINE_CACHE_MS = 6L * 60L * 60_000L;
     static final int MAX_QUEUED_SAMPLES = 30_000;
     static final int MAX_BATCH_SAMPLES = 600;
+    public static final long BACKLOG_PERSIST_INTERVAL_MS = 60_000L;
     private static final long INITIAL_RETRY_BACKOFF_MS = 15_000L;
     private static final long MAX_RETRY_BACKOFF_MS = 120_000L;
     private static final long MAX_CLIENT_ERROR_BACKOFF_MS = 900_000L;
     private static final long MAX_SESSION_RETRY_BACKOFF_MS = 600_000L;
     private static final int CHANGE_FLUSH_BPM = 3;
+    private static final int STORE_FORMAT_VERSION = 1;
     private static final Pattern COLLECTOR_ID = Pattern.compile("\"collector_id\"\\s*:\\s*\"([^\"]+)\"");
     private static final Pattern COLLECTOR_TOKEN = Pattern.compile("\"collector_token\"\\s*:\\s*\"([^\"]+)\"");
 
@@ -49,6 +55,7 @@ public final class HeartwithUploader {
     private FrozenBatch frozenBatch;
     private HeartwithUploadConfig config;
     private HeartwithUploadStatusListener statusListener;
+    private HeartwithUploadStore store;
     private Session session;
     private long lastSeq;
     private long lastFlushMs;
@@ -61,6 +68,8 @@ public final class HeartwithUploader {
     private boolean delayedFlushScheduled;
     private long delayedFlushDueElapsedMs;
     private int delayedFlushGeneration;
+    private long lastPersistElapsedMs;
+    private boolean storeHasBacklog;
     private int droppedSamples;
     private boolean closed;
 
@@ -107,10 +116,31 @@ public final class HeartwithUploader {
     }
 
     /**
+     * Attaches durable backlog storage and restores whatever a previous process left behind.
+     * Call once, before submitting samples.
+     */
+    public void setStore(final HeartwithUploadStore nextStore) {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            store = nextStore;
+        }
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                restoreBacklog(nextStore);
+            }
+        });
+    }
+
+    /**
      * Stops this uploader generation and cancels its main-thread flush callbacks.
      * A new module generation must create a new uploader instance.
      */
     public void close() {
+        byte[] snapshot = null;
+        HeartwithUploadStore target;
         synchronized (this) {
             if (closed) {
                 return;
@@ -121,6 +151,13 @@ public final class HeartwithUploader {
             delayedFlushDueElapsedMs = 0L;
             handler.removeCallbacksAndMessages(null);
             statusListener = null;
+            target = store;
+            if (target != null && (storeHasBacklog || hasPendingSamples())) {
+                snapshot = snapshotLocked();
+            }
+        }
+        if (target != null && snapshot != null) {
+            saveQuietly(target, snapshot);
         }
     }
 
@@ -229,12 +266,21 @@ public final class HeartwithUploader {
             uploadInFlight = true;
         }
         Outcome outcome = execute(attempt);
+        byte[] snapshot = null;
+        HeartwithUploadStore target = null;
         synchronized (this) {
             uploadInFlight = false;
             if (closed) {
                 return;
             }
             applyOutcomeLocked(attempt, outcome);
+            target = store;
+            if (target != null) {
+                snapshot = backlogSnapshotIfDueLocked(outcome.failure == null);
+            }
+        }
+        if (target != null && snapshot != null) {
+            saveQuietly(target, snapshot);
         }
     }
 
@@ -686,6 +732,139 @@ public final class HeartwithUploader {
 
     private boolean hasPendingUpload() {
         return !samples.isEmpty() || pendingSleepStatus != null || frozenBatch != null;
+    }
+
+    // ---- durable backlog -------------------------------------------------------------
+
+    /**
+     * Returns a snapshot to save, or null when nothing needs to be written. A healthy
+     * connection writes nothing; a failing one writes at most once per interval; the store is
+     * cleared once after the backlog drains.
+     */
+    private byte[] backlogSnapshotIfDueLocked(boolean succeeded) {
+        boolean pending = hasPendingSamples();
+        if (!pending) {
+            if (!storeHasBacklog) {
+                return null;
+            }
+            storeHasBacklog = false;
+            return new byte[0];
+        }
+        if (succeeded && !storeHasBacklog) {
+            return null;
+        }
+        long elapsed = SystemClock.elapsedRealtime();
+        if (storeHasBacklog && lastPersistElapsedMs > 0L
+                && elapsed - lastPersistElapsedMs < BACKLOG_PERSIST_INTERVAL_MS) {
+            return null;
+        }
+        lastPersistElapsedMs = elapsed;
+        storeHasBacklog = true;
+        return snapshotLocked();
+    }
+
+    private byte[] snapshotLocked() {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            DataOutputStream out = new DataOutputStream(bytes);
+            out.writeInt(STORE_FORMAT_VERSION);
+            out.writeLong(lastSeq);
+            boolean hasFrozen = frozenBatch != null && !frozenBatch.samples.isEmpty();
+            out.writeBoolean(hasFrozen);
+            if (hasFrozen) {
+                out.writeLong(frozenBatch.seq);
+                writeSamples(out, frozenBatch.samples);
+            }
+            writeSamples(out, new ArrayList<>(samples));
+            out.flush();
+            return bytes.toByteArray();
+        } catch (IOException exception) {
+            return null;
+        }
+    }
+
+    private static void writeSamples(DataOutputStream out, List<Sample> list) throws IOException {
+        out.writeInt(list.size());
+        String source = list.isEmpty() ? "heartwith" : list.get(list.size() - 1).source;
+        out.writeUTF(source);
+        for (Sample sample : list) {
+            out.writeLong(sample.tMs);
+            out.writeShort(sample.bpm);
+        }
+    }
+
+    private static List<Sample> readSamples(DataInputStream in) throws IOException {
+        int count = in.readInt();
+        if (count < 0 || count > MAX_QUEUED_SAMPLES + MAX_BATCH_SAMPLES) {
+            throw new IOException("invalid sample count " + count);
+        }
+        String source = in.readUTF();
+        List<Sample> list = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            list.add(new Sample(in.readLong(), in.readShort(), null, source));
+        }
+        return list;
+    }
+
+    private void restoreBacklog(HeartwithUploadStore source) {
+        if (source == null) {
+            return;
+        }
+        byte[] data;
+        try {
+            data = source.load();
+        } catch (Throwable throwable) {
+            return;
+        }
+        if (data == null || data.length == 0) {
+            return;
+        }
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            try {
+                DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
+                if (in.readInt() != STORE_FORMAT_VERSION) {
+                    return;
+                }
+                lastSeq = Math.max(lastSeq, in.readLong());
+                List<Sample> restored = new ArrayList<>();
+                if (in.readBoolean()) {
+                    long seq = in.readLong();
+                    List<Sample> frozen = readSamples(in);
+                    if (frozenBatch == null && !frozen.isEmpty()) {
+                        // Keep the original seq: if that attempt actually landed, the server
+                        // deduplicates the retry instead of storing the samples twice.
+                        frozenBatch = new FrozenBatch(seq, frozen, null);
+                    } else {
+                        restored.addAll(frozen);
+                    }
+                }
+                restored.addAll(readSamples(in));
+                for (int i = restored.size() - 1; i >= 0; i--) {
+                    samples.addFirst(restored.get(i));
+                }
+                trim(System.currentTimeMillis());
+                storeHasBacklog = true;
+                if (HeartwithUploaderDebug.ENABLED) {
+                    HeartwithUploaderDebug.log("restored backlog samples=" + samples.size()
+                            + ", frozen=" + (frozenBatch != null));
+                }
+                if (hasPendingUpload()) {
+                    scheduleDelayedFlush(1_000L);
+                }
+            } catch (Throwable ignored) {
+                // A corrupt snapshot only costs the backlog it described.
+            }
+        }
+    }
+
+    private static void saveQuietly(HeartwithUploadStore target, byte[] snapshot) {
+        try {
+            target.save(snapshot);
+        } catch (Throwable ignored) {
+        }
     }
 
     private String match(String value, Pattern pattern) {

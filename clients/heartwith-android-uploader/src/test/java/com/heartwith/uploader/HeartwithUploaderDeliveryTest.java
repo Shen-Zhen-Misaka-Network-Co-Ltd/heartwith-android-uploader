@@ -1,6 +1,7 @@
 package com.heartwith.uploader;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.robolectric.Shadows.shadowOf;
 
@@ -73,6 +74,37 @@ public final class HeartwithUploaderDeliveryTest {
         assertTrue(worker.awaitTermination(5, TimeUnit.SECONDS));
     }
 
+    @Test
+    public void backlogSurvivesARestartAndKeepsTheFrozenSeq() {
+        MemoryStore store = new MemoryStore();
+        RecordingClient failing = new RecordingClient();
+        failing.batchCode = 503;
+        HeartwithUploader first = newUploader(failing);
+        first.setStore(store);
+        first.submitHeartRate(80, 0L, null, "test");
+        idleSeconds(10);
+        first.submitHeartRate(90, 0L, null, "test");
+        assertEquals(1, failing.batches.size());
+        assertNotNull(store.data);
+        assertTrue(store.data.length > 0);
+        first.close();
+
+        RecordingClient healthy = new RecordingClient();
+        HeartwithUploader second = newUploader(healthy);
+        second.setStore(store);
+        idleSeconds(5);
+        assertTrue(healthy.batches.size() >= 1);
+        assertEquals(seqOf(failing.batches.get(0)), seqOf(healthy.batches.get(0)));
+        idleSeconds(15);
+        int bpmCount = 0;
+        for (byte[] batch : healthy.batches) {
+            bpmCount += countBpm(batch);
+        }
+        assertEquals(2, bpmCount);
+        assertEquals("store cleared after the backlog drained", 0, store.data.length);
+        second.close();
+    }
+
     private static HeartwithUploader newUploader(HeartwithHttpClient client) {
         HeartwithUploader uploader = new HeartwithUploader(Runnable::run, client);
         uploader.configure(config("test"));
@@ -128,6 +160,20 @@ public final class HeartwithUploaderDeliveryTest {
             return i;
         }
         return -1;
+    }
+
+    private static final class MemoryStore implements HeartwithUploadStore {
+        byte[] data;
+
+        @Override
+        public byte[] load() {
+            return data;
+        }
+
+        @Override
+        public void save(byte[] snapshot) {
+            data = snapshot;
+        }
     }
 
     private static final class RecordingClient implements HeartwithHttpClient {
