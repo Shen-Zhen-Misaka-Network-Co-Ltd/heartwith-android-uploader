@@ -590,7 +590,21 @@ public final class HeartwithUploader {
     }
 
     private String escapeJson(String value) {
-        return value == null ? "" : value.replace("\\", "\\\\").replace("\"", "\\\"");
+        if (value == null) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder(value.length() + 8);
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '"' || c == '\\') {
+                builder.append('\\').append(c);
+            } else if (c < 0x20) {
+                builder.append(String.format(java.util.Locale.ROOT, "\\u%04x", (int) c));
+            } else {
+                builder.append(c);
+            }
+        }
+        return builder.toString();
     }
 
     private static final class HttpStatusException extends Exception {
